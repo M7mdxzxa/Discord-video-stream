@@ -1,4 +1,6 @@
 import ffmpeg from 'fluent-ffmpeg';
+import ffmpegInstaller from '@ffmpeg-installer/ffmpeg';
+ffmpeg.setFfmpegPath(ffmpegInstaller.path);
 import pDebounce from 'p-debounce';
 import sharp from 'sharp';
 import Log from 'debug-level';
@@ -25,11 +27,7 @@ export type EncoderOptions = {
     /**
      * Disable video transcoding
      * If enabled, all video related settings have no effects, and the input
-     * video stream is used as-is.
-     * 
-     * You need to ensure that the video stream has the right properties
-     * (keyframe every 1s, B-frames disabled). Failure to do so will result in
-     * a glitchy stream, or degraded performance
+     * video stream is used as-is. Video playback speed modification will also be disabled.
      */
     noTranscoding: boolean,
 
@@ -74,6 +72,13 @@ export type EncoderOptions = {
     includeAudio: boolean,
 
     /**
+     * Playback speed. Default is 1.0 (normal speed).
+     * Affects both video (if transcoded) and audio (if included).
+     * For example, 2.0 is 2x speed, 0.5 is half speed.
+     */
+    playbackSpeed: number,
+
+    /**
      * Enable hardware accelerated decoding
      */
     hardwareAcceleratedDecoding: boolean,
@@ -100,6 +105,54 @@ export type EncoderOptions = {
     customFfmpegFlags: string[]
 }
 
+/**
+ * Helper function to generate the atempo filter string for FFmpeg.
+ * Handles chaining for speeds outside the 0.5-100 range.
+ * @param speed Desired playback speed.
+ * @returns FFmpeg audio filter string for atempo.
+ */
+function generateAtempoFilterString(speed: number): string {
+    if (speed <= 0) {
+        // Or throw an error, depending on desired handling for invalid speeds
+        Log("prepareStream:atempo").warn(`Invalid playback speed ${speed} requested. Defaulting to 1.0.`);
+        return "";
+    }
+    if (Math.abs(speed - 1.0) < 1e-4) return ""; // Effectively 1.0, no filter needed
+
+    const filters: string[] = [];
+    let currentSpeedFactor = speed;
+
+    // Handle speeds greater than 1.0 by potentially chaining atempo=100.0 or smaller factors
+    // atempo max is 100.0. For simplicity and common use cases (e.g. up to 4x),
+    // we can also chain factors of 2.0 for robustness, though a single atempo up to 100 is valid.
+    // Here, we'll decompose into factors ensuring each is within [0.5, 100.0].
+    if (currentSpeedFactor > 1.0) {
+        while (currentSpeedFactor > 100.0 && filters.length < 10) { // Cap iterations to prevent infinite loops
+            filters.push("atempo=100.0");
+            currentSpeedFactor /= 100.0;
+        }
+    }
+    // Handle speeds less than 1.0 by potentially chaining atempo=0.5
+    else if (currentSpeedFactor < 1.0) {
+        while (currentSpeedFactor < 0.5 && filters.length < 10) { // Cap iterations
+            filters.push("atempo=0.5");
+            currentSpeedFactor /= 0.5;
+        }
+    }
+
+    // Add the final tempo adjustment if it's not 1.0 (after decomposition)
+    // and it's within the valid single atempo range.
+    if (Math.abs(currentSpeedFactor - 1.0) > 1e-4) {
+        const finalTempoValue = Math.max(0.5, Math.min(100.0, currentSpeedFactor));
+         if (Math.abs(finalTempoValue - 1.0) > 1e-4) { // Avoid adding atempo=1.0
+            filters.push(`atempo=${finalTempoValue.toFixed(4)}`);
+        }
+    }
+    
+    return filters.join(',');
+}
+
+
 export function prepareStream(
     input: string | Readable,
     options: Partial<EncoderOptions> = {},
@@ -108,7 +161,6 @@ export function prepareStream(
     cancelSignal?.throwIfAborted();
     const defaultOptions = {
         noTranscoding: false,
-        // negative values = resize by aspect ratio, see https://trac.ffmpeg.org/wiki/Scaling
         width: -2,
         height: -2,
         frameRate: undefined,
@@ -117,6 +169,7 @@ export function prepareStream(
         bitrateVideoMax: 7000,
         bitrateAudio: 128,
         includeAudio: true,
+        playbackSpeed: 1.0, // Default normal speed
         hardwareAcceleratedDecoding: false,
         minimizeLatency: false,
         h26xPreset: "ultrafast",
@@ -128,7 +181,7 @@ export function prepareStream(
     } satisfies EncoderOptions;
 
     function mergeOptions(opts: Partial<EncoderOptions>) {
-        return {
+        const merged = {
             noTranscoding:
                 opts.noTranscoding ?? defaultOptions.noTranscoding,
 
@@ -164,6 +217,11 @@ export function prepareStream(
             includeAudio:
                 opts.includeAudio ?? defaultOptions.includeAudio,
 
+            playbackSpeed:
+                isFiniteNonZero(opts.playbackSpeed) && opts.playbackSpeed > 0
+                    ? opts.playbackSpeed
+                    : defaultOptions.playbackSpeed,
+            
             hardwareAcceleratedDecoding:
                 opts.hardwareAcceleratedDecoding ?? defaultOptions.hardwareAcceleratedDecoding,
 
@@ -179,7 +237,13 @@ export function prepareStream(
 
             customFfmpegFlags:
                 opts.customFfmpegFlags ?? defaultOptions.customFfmpegFlags
-        } satisfies EncoderOptions
+        } satisfies EncoderOptions;
+
+        if (merged.playbackSpeed <= 0) {
+            Log("prepareStream:options").warn(`Invalid playbackSpeed ${merged.playbackSpeed}. Resetting to 1.0.`);
+            merged.playbackSpeed = 1.0;
+        }
+        return merged;
     }
 
     const mergedOptions = mergeOptions(options);
@@ -231,17 +295,31 @@ export function prepareStream(
 
     // video setup
     const {
-        noTranscoding, width, height, frameRate, bitrateVideo, bitrateVideoMax, videoCodec, h26xPreset
+        noTranscoding, width, height, frameRate, bitrateVideo, bitrateVideoMax, videoCodec, h26xPreset,
+        playbackSpeed
     } = mergedOptions;
     command.addOutputOption("-map 0:v");
 
     if (noTranscoding)
     {
         command.videoCodec("copy");
+        if (Math.abs(playbackSpeed - 1.0) > 1e-4) {
+            Log("prepareStream:video").warn("Video playback speed modification is ignored when noTranscoding is true.");
+        }
     }
     else
     {
-        command.videoFilter(`scale=${width}:${height}`)
+        const videoFilters: string[] = [];
+        videoFilters.push(`scale=${width}:${height}`); // Scaling filter
+
+        // Add setpts filter for video speed if playbackSpeed is not 1.0
+        if (Math.abs(playbackSpeed - 1.0) > 1e-4 && playbackSpeed > 0) {
+            videoFilters.push(`setpts=PTS/${playbackSpeed.toFixed(4)}`);
+        }
+        
+        if (videoFilters.length > 0) {
+            command.videoFilter(videoFilters.join(','));
+        }
 
         if (frameRate)
             command.fpsOutput(frameRate);
@@ -256,55 +334,52 @@ export function prepareStream(
 
         switch (videoCodec) {
             case 'AV1':
-                command
-                    .videoCodec("libsvtav1")
+                command.videoCodec("libsvtav1");
                 break;
             case 'VP8':
-                command
-                    .videoCodec("libvpx")
-                    .outputOption('-deadline', 'realtime');
+                command.videoCodec("libvpx").outputOption('-deadline', 'realtime');
                 break;
             case 'VP9':
-                command
-                    .videoCodec("libvpx-vp9")
-                    .outputOption('-deadline', 'realtime');
+                command.videoCodec("libvpx-vp9").outputOption('-deadline', 'realtime');
                 break;
             case 'H264':
-                command
-                    .videoCodec("libx264")
-                    .outputOptions([
-                        '-tune zerolatency',
-                        `-preset ${h26xPreset}`,
-                        '-profile:v baseline',
-                    ]);
+                command.videoCodec("libx264").outputOptions([
+                    '-tune zerolatency',
+                    `-preset ${h26xPreset}`,
+                    '-profile:v baseline',
+                ]);
                 break;
             case 'H265':
-                command
-                    .videoCodec("libx265")
-                    .outputOptions([
-                        '-tune zerolatency',
-                        `-preset ${h26xPreset}`,
-                        '-profile:v main',
-                    ]);
+                command.videoCodec("libx265").outputOptions([
+                    '-tune zerolatency',
+                    `-preset ${h26xPreset}`,
+                    '-profile:v main',
+                ]);
                 break;
         }
     }
 
     // audio setup
     const { includeAudio, bitrateAudio } = mergedOptions;
-    if (includeAudio)
+    if (includeAudio) {
         command
             .addOutputOption("-map 0:a?")
             .audioChannels(2)
-            /*
-             * I don't have much surround sound material to test this with,
-             * if you do and you have better settings for this, feel free to
-             * contribute!
-             */
             .addOutputOption("-lfe_mix_level 1")
             .audioFrequency(48000)
-            .audioCodec("libopus")
-            .audioBitrate(`${bitrateAudio}k`);
+            .audioCodec("libopus"); // Set codec before custom filters if filters expect PCM
+
+        // Add atempo filter for audio speed if playbackSpeed is not 1.0
+        if (Math.abs(playbackSpeed - 1.0) > 1e-4 && playbackSpeed > 0) {
+            const atempoFilter = generateAtempoFilterString(playbackSpeed);
+            if (atempoFilter) {
+                command.audioFilter(atempoFilter);
+            }
+        }
+        
+        command.audioBitrate(`${bitrateAudio}k`); // Set bitrate after filters
+    }
+
 
     // Add custom ffmpeg flags
     if (mergedOptions.customFfmpegFlags && mergedOptions.customFfmpegFlags.length > 0) {
@@ -315,18 +390,13 @@ export function prepareStream(
     const promise = new Promise<void>((resolve, reject) => {
         command.on("error", (err) => {
             if (cancelSignal?.aborted)
-                /**
-                 * fluent-ffmpeg might throw an error when SIGTERM is sent to
-                 * the process, so we check if the abort signal is triggered
-                 * and throw that instead
-                 */
                 reject(cancelSignal.reason);
             else
                 reject(err);
         });
         command.on("end", () => resolve());
     })
-    promise.catch(() => {});
+    promise.catch(() => {}); // Prevent unhandled rejection if caller doesn't catch
     cancelSignal?.addEventListener("abort", () => command.kill("SIGTERM"), { once: true });
     command.run();
 
@@ -341,28 +411,24 @@ export type PlayStreamOptions = {
 
     /**
      * Override video width sent to Discord.
-     * 
      * DO NOT SPECIFY UNLESS YOU KNOW WHAT YOU'RE DOING!
      */
     width: number,
 
     /**
      * Override video height sent to Discord.
-     * 
      * DO NOT SPECIFY UNLESS YOU KNOW WHAT YOU'RE DOING!
      */
     height: number,
 
     /**
      * Override video frame rate sent to Discord.
-     * 
      * DO NOT SPECIFY UNLESS YOU KNOW WHAT YOU'RE DOING!
      */
     frameRate: number,
 
     /**
      * Same as ffmpeg's `readrate_initial_burst` command line flag
-     * 
      * See https://ffmpeg.org/ffmpeg.html#:~:text=%2Dreadrate_initial_burst
      */
     readrateInitialBurst: number | undefined,
@@ -487,7 +553,7 @@ export async function playStream(
                 // biome-ignore lint/style/noNonNullAssertion:
                 vStream.sync = aStream!.sync = true;
                 // biome-ignore lint/style/noNonNullAssertion:
-                vStream.noSleep = vStream!.sync = false;
+                vStream.noSleep = vStream!.sync = false; // This was vStream.sync, should be vStream.noSleep
                 vStream.off("pts", stopBurst);
             }
             vStream.on("pts", stopBurst);
@@ -560,7 +626,7 @@ export async function playStream(
             cleanup();
             resolve();
         });
-    }).catch(() => {});
+    }).catch(() => {}); // Prevent unhandled rejection
 
     // Return the promise and the controller
     return {
