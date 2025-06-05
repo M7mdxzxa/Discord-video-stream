@@ -5,7 +5,7 @@ import Log from 'debug-level';
 import { demux } from './LibavDemuxer.js';
 import { setTimeout as delay } from 'node:timers/promises';
 import { PassThrough, type Readable } from "node:stream";
-import { VideoStream } from './VideoStream.js';
+import { VideoStream } from './VideoStream.s';
 import { AudioStream } from './AudioStream.js';
 import { isFiniteNonZero } from '../utils.js';
 import { AVCodecID } from './LibavCodecId.js';
@@ -15,10 +15,20 @@ import LibAV from '@lng2004/libav.js-variant-webcodecs-avf-with-decoders';
 import type { SupportedVideoCodec } from '../utils.js';
 import type { MediaUdp, Streamer } from '../client/index.js';
 
+// Define a type for the stream output and the FFmpeg command
+type StreamProcess = {
+    command: ffmpeg.FfmpegCommand;
+    output: PassThrough;
+    promise: Promise<void>;
+};
+
 export interface Controller {
     mute(): void;
     unmute(): void;
     isMuted(): boolean;
+    // Modified: setVolume will now take a callback to restart the stream
+    setVolume(level: number, restartStream: (newVolume: number) => Promise<void>): Promise<void>;
+    getVolume(): number;
 }
 
 export type EncoderOptions = {
@@ -26,7 +36,7 @@ export type EncoderOptions = {
      * Disable video transcoding
      * If enabled, all video related settings have no effects, and the input
      * video stream is used as-is.
-     * 
+     *
      * You need to ensure that the video stream has the right properties
      * (keyframe every 1s, B-frames disabled). Failure to do so will result in
      * a glitchy stream, or degraded performance
@@ -97,14 +107,19 @@ export type EncoderOptions = {
      * Custom ffmpeg flags/options to pass directly to ffmpeg
      * These will be added to the command after other options
      */
-    customFfmpegFlags: string[]
+    customFfmpegFlags: string[],
+
+    /**
+     * Audio volume level (0.0 to N, 1.0 is original)
+     */
+    volume: number, // Added volume option
 }
 
 export function prepareStream(
     input: string | Readable,
     options: Partial<EncoderOptions> = {},
     cancelSignal?: AbortSignal
-) {
+): StreamProcess { // Explicitly define return type
     cancelSignal?.throwIfAborted();
     const defaultOptions = {
         noTranscoding: false,
@@ -124,7 +139,8 @@ export function prepareStream(
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/107.0.0.0 Safari/537.3",
             "Connection": "keep-alive",
         },
-        customFfmpegFlags: []
+        customFfmpegFlags: [],
+        volume: 1.0, // Default volume
     } satisfies EncoderOptions;
 
     function mergeOptions(opts: Partial<EncoderOptions>) {
@@ -178,7 +194,12 @@ export function prepareStream(
             },
 
             customFfmpegFlags:
-                opts.customFfmpegFlags ?? defaultOptions.customFfmpegFlags
+                opts.customFfmpegFlags ?? defaultOptions.customFfmpegFlags,
+
+            volume:
+                isFiniteNonZero(opts.volume) && opts.volume >= 0
+                    ? opts.volume
+                    : defaultOptions.volume, // Merge volume option
         } satisfies EncoderOptions
     }
 
@@ -291,8 +312,8 @@ export function prepareStream(
     }
 
     // audio setup
-    const { includeAudio, bitrateAudio } = mergedOptions;
-    if (includeAudio)
+    const { includeAudio, bitrateAudio, volume } = mergedOptions; // Destructure volume
+    if (includeAudio) {
         command
             .addOutputOption("-map 0:a?")
             .audioChannels(2)
@@ -305,6 +326,13 @@ export function prepareStream(
             .audioFrequency(48000)
             .audioCodec("libopus")
             .audioBitrate(`${bitrateAudio}k`);
+
+        // Add volume filter ONLY IF volume is not 1.0 (default) or it's 0 (mute)
+        if (volume !== 1.0) { // Using !== to be explicit, comparing floating points can be tricky, but for basic 1.0 it's fine.
+            command.audioFilter(`volume=${volume}`);
+        }
+    }
+
 
     // Add custom ffmpeg flags
     if (mergedOptions.customFfmpegFlags && mergedOptions.customFfmpegFlags.length > 0) {
@@ -341,28 +369,28 @@ export type PlayStreamOptions = {
 
     /**
      * Override video width sent to Discord.
-     * 
+     *
      * DO NOT SPECIFY UNLESS YOU KNOW WHAT YOU'RE DOING!
      */
     width: number,
 
     /**
      * Override video height sent to Discord.
-     * 
+     *
      * DO NOT SPECIFY UNLESS YOU KNOW WHAT YOU'RE DOING!
      */
     height: number,
 
     /**
      * Override video frame rate sent to Discord.
-     * 
+     *
      * DO NOT SPECIFY UNLESS YOU KNOW WHAT YOU'RE DOING!
      */
     frameRate: number,
 
     /**
      * Same as ffmpeg's `readrate_initial_burst` command line flag
-     * 
+     *
      * See https://ffmpeg.org/ffmpeg.html#:~:text=%2Dreadrate_initial_burst
      */
     readrateInitialBurst: number | undefined,
@@ -376,7 +404,10 @@ export type PlayStreamOptions = {
 export async function playStream(
     input: Readable, streamer: Streamer,
     options: Partial<PlayStreamOptions> = {},
-    cancelSignal?: AbortSignal
+    cancelSignal?: AbortSignal,
+    initialVolume: number = 1.0, // Added initial volume parameter
+    // This callback is crucial for restarting the stream with new volume
+    restartFfmpegProcess: (newVolume: number) => Promise<void>
 )
 {
     const logger = new Log("playStream");
@@ -465,13 +496,18 @@ export async function playStream(
     });
 
     const vStream = new VideoStream(udp);
+    // VStream still pipes directly from the demuxer's video stream
     video.stream.pipe(vStream);
 
-    let aStream: AudioStream | undefined; // Declare the audio stream instance
+    let aStream: AudioStream | undefined;
+
+    // Keep track of the current volume level in playStream context
+    let currentVolume = initialVolume;
 
     if (audio)
     {
         aStream = new AudioStream(udp);
+        // AStream still pipes directly from the demuxer's audio stream
         audio.stream.pipe(aStream);
         vStream.syncStream = aStream;
         aStream.syncStream = vStream;
@@ -573,6 +609,20 @@ export async function playStream(
             },
             isMuted() {
                 return !!aStream?.isMuted();
+            },
+            async setVolume(level: number, restartCallback: (newVolume: number) => Promise<void>) {
+                if (currentVolume === level) {
+                    logger.debug(`Volume already at ${level}, no change needed.`);
+                    return;
+                }
+                logger.debug(`Attempting to set volume to ${level} and restart stream.`);
+                currentVolume = Math.max(0, level); // Store the new volume
+                // Trigger the restart function provided by the bot.ts
+                await restartCallback(currentVolume);
+                logger.debug(`Stream restarted with new volume: ${currentVolume}`);
+            },
+            getVolume() {
+                return currentVolume;
             }
         } satisfies Controller,
         done: streamPromise
